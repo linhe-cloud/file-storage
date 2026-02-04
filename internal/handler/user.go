@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"file-storage-linhe/internal/cache/redis"
 	"file-storage-linhe/internal/db"
 	"file-storage-linhe/internal/handler/auth"
+	"file-storage-linhe/internal/mq"
 	"net/http"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -86,6 +89,17 @@ func SignupHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 记录注册成功日志
+	LogOperation(
+		r.Context(),
+		r,
+		username,
+		mq.OpSignup,
+		mq.ResourceTypeUser,
+		username,
+		nil,
+	)
+
 	writeJSON(w, http.StatusOK, map[string]string{"result": "OK"})
 }
 
@@ -111,6 +125,16 @@ func SigninHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 校验密码
 	if !verifyPassword(u.UserPwd, password) {
+		// 记录登录失败日志
+		LogOperationError(
+			r.Context(),
+			r,
+			username,
+			mq.OpLogin,
+			mq.ResourceTypeUser,
+			username,
+			"密码错误",
+		)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 		return
 	}
@@ -129,6 +153,17 @@ func SigninHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 记录登录日志
+	LogOperation(
+		r.Context(),
+		r,
+		username,
+		mq.OpLogin,
+		mq.ResourceTypeUser,
+		username,
+		nil,
+	)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"username": username,
 		"token":    token,
@@ -144,16 +179,26 @@ func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 查询用户信息
-	u, err := db.GetUserInfo(r.Context(), username)
+	// 从缓存获取用户信息（缓存未命中时自动查DB并回写）
+	user, err := redis.GetUserInfoCache(r.Context(), username, func(ctx context.Context, username string) (*redis.User, error) {
+		// 适配器：将 db.User 转换为 redis.User
+		dbUser, err := db.GetUserInfo(ctx, username)
+		if err != nil {
+			return nil, err
+		}
+		return &redis.User{
+			UserName: dbUser.UserName,
+			SignupAt: dbUser.SignupAt,
+		}, nil
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "get user info failed"})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"username":  u.UserName,
-		"signup_at": u.SignupAt,
+		"username":  user.UserName,
+		"signup_at": user.SignupAt,
 	})
 }
 
@@ -174,6 +219,18 @@ func SignoutHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "signout failed"})
 		return
 	}
+
+	// 记录登出日志
+	LogOperation(
+		r.Context(),
+		r,
+		username,
+		mq.OpLogout,
+		mq.ResourceTypeUser,
+		username,
+		nil,
+	)
+
 	writeJSON(w, http.StatusOK, map[string]string{"result": "OK"})
 }
 
@@ -195,4 +252,42 @@ func OnlineDevicesHandler(w http.ResponseWriter, r *http.Request) {
 		"device_count":  count,
 		"online_status": count > 0,
 	})
+}
+
+// UserLogsHandler 查询操作日志：GET /user/logs
+func UserLogsHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        return
+    }
+
+    username, ok := auth.UsernameFromContext(r.Context())
+    if !ok || username == "" {
+        writeJSON(w, http.StatusUnauthorized, map[string]string{
+            "error": "unauthorized",
+        })
+        return
+    }
+
+    // 获取查询参数
+    limitStr := r.URL.Query().Get("limit")
+    limit := 100 // 默认100条
+    if limitStr != "" {
+        if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 500 {
+            limit = l
+        }
+    }
+
+    logs, err := db.GetUserOperationLogs(r.Context(), username, limit)
+    if err != nil {
+        writeJSON(w, http.StatusInternalServerError, map[string]string{
+            "error": "failed to get operation logs",
+        })
+        return
+    }
+
+    writeJSON(w, http.StatusOK, map[string]interface{}{
+        "logs":  logs,
+        "count": len(logs),
+    })
 }

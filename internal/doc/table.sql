@@ -48,3 +48,22 @@ CREATE TABLE `tbl_user_file` (
   KEY `idx_status` (`status`),
   KEY `idx_user_id` (`user_name`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 创建操作日志表
+CREATE TABLE `tbl_operation_log` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT,
+  `user_name` varchar(64) NOT NULL DEFAULT '' COMMENT '操作用户',
+  `operation` varchar(64) NOT NULL DEFAULT '' COMMENT '操作类型(login/upload/download/delete等)',
+  `resource_type` varchar(32) DEFAULT '' COMMENT '资源类型(file/user等)',
+  `resource_id` varchar(128) DEFAULT '' COMMENT '资源ID(文件hash/用户名等)',
+  `ip_address` varchar(64) DEFAULT '' COMMENT 'IP地址',
+  `user_agent` varchar(512) DEFAULT '' COMMENT 'User-Agent',
+  `status` varchar(16) DEFAULT 'success' COMMENT '操作状态(success/failed)',
+  `error_msg` text COMMENT '错误信息',
+  `extra_info` text COMMENT '额外信息(JSON格式)',
+  `created_at` datetime DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_user_name` (`user_name`),
+  KEY `idx_operation` (`operation`),
+  KEY `idx_created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='操作日志表';

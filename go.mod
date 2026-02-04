@@ -33,5 +33,6 @@ require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/minio/minio-go/v7 v7.0.97
+	github.com/rabbitmq/amqp091-go v1.10.0
 	golang.org/x/crypto v0.46.0
 )

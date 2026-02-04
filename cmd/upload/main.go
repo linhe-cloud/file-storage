@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"file-storage-linhe/internal/cache/redis"
+	"file-storage-linhe/internal/consumer"
 	"file-storage-linhe/internal/db"
 	"file-storage-linhe/internal/handler"
 	"file-storage-linhe/internal/handler/auth"
+	"file-storage-linhe/internal/mq"
 	"file-storage-linhe/internal/store"
 
 	"log"
@@ -25,6 +27,20 @@ func main() {
 		log.Fatalf("init redis failed: %v", err)
 	}
 
+	if err := mq.InitRabbitMQ(); err != nil {
+		log.Fatalf("init rabbitmq failed: %v", err)
+	}
+	defer mq.Close()
+
+	if err := consumer.StartFileDeleteConsumer(); err != nil {
+		log.Fatalf("start file delete consumer failed: %v", err)
+	}
+
+	// 启动操作日志消费者
+	if err := consumer.StartOperationLogConsumer(); err != nil {
+		log.Fatalf("start operation log consumer failed: %v", err)
+	}
+
 	// 用户接口
 	http.HandleFunc("/user/signup", handler.RecoverMiddleware(handler.SignupHandler))
 	http.HandleFunc("/user/signin", handler.RecoverMiddleware(handler.SigninHandler))
@@ -42,6 +58,14 @@ func main() {
 	http.HandleFunc("/file/multipart/upload", handler.RecoverMiddleware(auth.Auth(handler.MultipartUploadHandler)))
 	http.HandleFunc("/file/multipart/status", handler.RecoverMiddleware(auth.Auth(handler.MultipartStatusHandler)))
 	http.HandleFunc("/file/multipart/complete", handler.RecoverMiddleware(auth.Auth(handler.MultipartCompleteHandler)))
+
+	// 回收站接口
+	http.HandleFunc("/file/recycle", handler.RecoverMiddleware(auth.Auth(handler.RecycleHandler)))
+	http.HandleFunc("/file/restore", handler.RecoverMiddleware(auth.Auth(handler.RestoreFileHandler)))
+
+	// 操作日志接口
+	http.HandleFunc("/user/logs", handler.RecoverMiddleware(auth.Auth(handler.UserLogsHandler)))
+
 
 	// 健康检查
 	http.HandleFunc("/health", handler.RecoverMiddleware(func(w http.ResponseWriter, r *http.Request) {

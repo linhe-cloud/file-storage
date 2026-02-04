@@ -10,10 +10,12 @@ import (
 	"file-storage-linhe/internal/db"
 	"file-storage-linhe/internal/handler/auth"
 	"file-storage-linhe/internal/meta"
+	"file-storage-linhe/internal/mq"
 	"file-storage-linhe/internal/store"
 	"file-storage-linhe/util"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -29,6 +31,13 @@ import (
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 获取当前用户名
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
@@ -108,6 +117,24 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 写入缓存
+	_ = cacheRedis.SetFileMetaCache(r.Context(), fileMeta)
+
+	// 记录上传成功日志
+	LogOperation(
+		r.Context(),
+		r,
+		username,
+		mq.OpUpload,
+		mq.ResourceTypeFile,
+		fileMeta.FileSha1,
+		map[string]string{
+			"file_name": fileMeta.FileName,
+			"file_size": strconv.FormatInt(fileMeta.FileSize, 10),
+		},
+	)
+
+
 	// 返回成功响应
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"file_sha1": fileMeta.FileSha1,
@@ -121,6 +148,13 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 获取当前用户名
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
@@ -151,6 +185,19 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer obg.Close()
 
+	// 记录下载日志
+	LogOperation(
+		r.Context(),
+		r,
+		username,
+		mq.OpDownload,
+		mq.ResourceTypeFile,
+		fileHash,
+		map[string]string{
+			"file_name": fm.FileName,
+		},
+	)
+
 	// 设置响应头
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", "attachment; filename="+fm.FileName+"\"")
@@ -176,8 +223,8 @@ func FileMetaHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 从数据库查询源文件信息
-	fm, err := db.GetFileMeta(r.Context(), fileHash)
+	// 从缓存获取文件元信息（缓存未命中时自动查DB并回写）
+	fm, err := cacheRedis.GetFileMetaCache(r.Context(), fileHash, db.GetFileMeta)
 	if err != nil || fm == nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -226,6 +273,8 @@ func FastUploadHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ======================= 删除 & 回收站 =======================
+
 // 删除文件：DELETE /file/delete
 func DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
@@ -251,20 +300,21 @@ func DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	// 源文件信息，拿到 MinIO 的 key
 	fm, err := db.GetFileMeta(ctx, fileHash)
 	if err != nil || fm == nil || fm.FileSha1 == "" {
-		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "file not found"})
 		return
 	}
 
 	// 删除当前用户这条用户文件记录（username + filehash）
+	// 软删
 	if err := db.DeleteUserFile(ctx, username, fileHash); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete user file record"})
 		return
 	}
 
 	// 检查该 filehash 还有其他用户
 	stileUsed, err := db.ExistsUserFileByHash(ctx, fileHash)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check file usage"})
 		return
 	}
 	if stileUsed {
@@ -275,19 +325,151 @@ func DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 删除 MinIO 对象
-	if err := store.MinioClient.RemoveObject(
-		ctx,
-		config.MinioBucket,
-		fm.Location,
-		minio.RemoveObjectOptions{},
-	); err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+	// 发送 MQ 延迟删除消息（3天后自动删除）
+	msg := &mq.FileDeleteMessage{
+		Username:  username,
+		FileHash:  fileHash,
+		FileName:  fm.FileName,
+		DeletedAt: time.Now(),
+	}
+	if err := mq.PublishFileDeleteMessage(ctx, msg); err != nil {
+		log.Printf("Failed to publish delete message: %v", err)
+		// 注意：即使 MQ 发送失败，用户侧已软删成功，不影响用户体验
+	}
+
+	LogOperation(
+		r.Context(),
+		r,
+		username,
+		mq.OpDelete,
+		mq.ResourceTypeFile,
+		fileHash,
+		map[string]string{
+			"file_name": fm.FileName,
+		},
+	)
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"result": "delete success",
+	})
+}
+
+
+// 回收站：GET /file/recycle
+func RecycleHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	// TODO：把status设为1，进入回收站缓存
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 
+	files, err := db.GetRecycleBinFiles(r.Context(), username)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to get recycle bin files"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"files": files,
+		"count": len(files),
+	})
+}
+
+// 恢复文件：POST /file/restore
+func RestoreFileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	_ = r.ParseForm()
+	fileHash := r.FormValue("filehash")
+	if fileHash == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	if err := db.RestoreUserFile(r.Context(), username, fileHash); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to restore file"})
+		return
+	}
+
+	LogOperation(
+		r.Context(),
+		r,
+		username,
+		mq.OpRestore,
+		mq.ResourceTypeFile,
+		fileHash,
+		nil,
+	)
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"result": "restore success",
+	})
+}
+
+func PremanentDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	
+	fileHash := r.URL.Query().Get("filehash")
+	if fileHash == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+
+	fm, err := db.GetFileMeta(ctx, fileHash)
+	if err != nil || fm == nil || fm.FileSha1 == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "file not found"})
+		return
+	}
+
+	if err := db.PermanentDeleteUserFile(ctx, username, fileHash); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete file"})
+		return
+	}
+
+	stillUsed, err := db.ExistsUserFileByHash(ctx, fileHash)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check file usage"})
+		return
+	}
+
+	if !stillUsed {
+		if err := db.PermanentDeleteFileMeta(ctx, fileHash); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete file meta"})
+			return
+		}
+
+		_ = cacheRedis.DeleteFileMetaCache(ctx, fileHash)
+		_ = db.PermanentDeleteFileMeta(ctx, fileHash)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"result": "delete success",
+	})
 }
 
 // ======================= 分片上传 =======================
@@ -621,6 +803,9 @@ func MultipartCompleteHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to insert file meta"})
 		return
 	}
+
+	// 写入缓存
+	_ = cacheRedis.SetFileMetaCache(ctx, fm)
 
 	// 写入用户-文件关系表
 	if username != "" {

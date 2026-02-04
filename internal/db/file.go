@@ -55,3 +55,76 @@ func ExistsUserFileByHash(ctx context.Context, filehash string) (bool, error) {
 	}
 	return cnt > 0, nil
 }
+
+type RecycleBinFile struct {
+	Username string `json:"username"`
+	FileHash string `json:"file_hash"`
+	FileName string `json:"file_name"`
+	UploadAt string `json:"upload_at"`
+	LastUpadte string `json:"last_update"`
+}
+
+// 获取回收站文件列表
+func GetRecycleBinFiles(ctx context.Context, username string) ([]*RecycleBinFile, error) {
+	rows, err := DB.QueryContext(ctx,
+		`SELECT user_name, file_sha1, file_name, upload_at, last_update
+		FROM tbl_user_file
+		WHERE user_name = ? AND status = 1
+		ORDER BY last_update DESC`,
+		username,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var files []*RecycleBinFile
+	for rows.Next() {
+		f := &RecycleBinFile{}
+		if err := rows.Scan(&f.Username, &f.FileHash, &f.FileName, &f.UploadAt, &f.LastUpadte); err != nil {
+			return nil, err
+		}
+		files = append(files, f)
+	}
+	return files, nil
+}
+
+// 恢复文件
+func RestoreUserFile(ctx context.Context, username, filehash string) error {
+	_, err := DB.ExecContext(ctx,
+		"UPDATE tbl_user_file SET status = 0 WHERE user_name = ? AND file_sha1 = ? AND status = 1",
+		username, filehash,
+	)
+	return err
+}
+
+// 永久删除文件
+func PermanentDeleteUserFile(ctx context.Context, username, filehash string) error {
+    _, err := DB.ExecContext(ctx,
+        "DELETE FROM tbl_user_file WHERE user_name = ? AND file_sha1 = ? AND status = 1",
+        username, filehash,
+    )
+    return err
+}
+
+// 永久删除文件元信息
+func PermanentDeleteFileMeta(ctx context.Context, filehash string) error {
+    _, err := DB.ExecContext(ctx,
+        "UPDATE tbl_file SET status = 1 WHERE file_sha1 = ?",
+        filehash,
+    )
+    return err
+}
+
+// 检查用户文件状态
+func CheckUserFileStatus(ctx context.Context, username, filehash string) (int, error) {
+    var status int
+    err := DB.QueryRowContext(ctx,
+        "SELECT status FROM tbl_user_file WHERE user_name = ? AND file_sha1 = ?",
+        username, filehash,
+    ).Scan(&status)
+	if err != nil {
+		return -1, err
+	}
+    return status, nil
+}

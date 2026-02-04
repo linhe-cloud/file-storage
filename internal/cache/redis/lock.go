@@ -45,7 +45,7 @@ func (l *Lock) TryLock() (bool, error) {
 // 释放锁
 func (l *Lock) Unlock() error {
 	const luaScript = `
-		if redis.call("GET", KEY[1]) == ARGV[1] then
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
 			return redis.call("DEL", KEYS[1])
 		else
 			return 0
