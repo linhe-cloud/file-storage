@@ -67,3 +67,21 @@ CREATE TABLE `tbl_operation_log` (
   KEY `idx_operation` (`operation`),
   KEY `idx_created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='操作日志表';
+
+-- 待发布消息表：数据库状态变更与消息投递意图在同一事务中提交
+CREATE TABLE `tbl_message_outbox` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `message_type` varchar(64) NOT NULL,
+  `aggregate_key` varchar(128) NOT NULL DEFAULT '',
+  `payload` json NOT NULL,
+  `status` varchar(16) NOT NULL DEFAULT 'pending',
+  `attempts` int NOT NULL DEFAULT 0,
+  `next_attempt_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `locked_at` datetime DEFAULT NULL,
+  `published_at` datetime DEFAULT NULL,
+  `last_error` text,
+  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_outbox_pending` (`status`, `next_attempt_at`),
+  KEY `idx_outbox_aggregate` (`aggregate_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

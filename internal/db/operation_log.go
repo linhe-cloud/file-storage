@@ -10,7 +10,7 @@ import (
 func InsertOperationLog(ctx context.Context, msg *mq.OperationLogMessage) error {
 	// 将 ExtraInfo map 转为 JSON 字符串
 	var extraInfoJSON string
-	if msg.ExtraInfo != nil && len(msg.ExtraInfo) > 0 {
+	if len(msg.ExtraInfo) > 0 {
 		data, err := json.Marshal(msg.ExtraInfo)
 		if err != nil {
 			extraInfoJSON = "{}"
@@ -73,12 +73,12 @@ func GetUserOperationLogs(ctx context.Context, username string, limit int) ([]*O
 		); err != nil {
 			return nil, err
 		}
-		
+
 		// 解析 JSON 格式的 extra_info
 		if extraInfo != "" {
 			json.Unmarshal([]byte(extraInfo), &log.ExtraInfo)
 		}
-		
+
 		logs = append(logs, log)
 	}
 	return logs, nil

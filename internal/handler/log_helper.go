@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"file-storage-linhe/internal/db"
 	"file-storage-linhe/internal/mq"
 )
 
@@ -17,8 +18,10 @@ func LogOperation(ctx context.Context, r *http.Request, username, operation, res
 
 	// 异步发送，不阻塞主流程
 	if err := mq.PublishOperationLog(ctx, msg); err != nil {
-		log.Printf("发送操作日志失败: %v", err)
-		// 注意：失败不影响业务
+		log.Printf("发送操作日志失败，转入 outbox: %v", err)
+		if outboxErr := db.EnqueueOutbox(ctx, "operation_log", msg.ResourceID, msg); outboxErr != nil {
+			log.Printf("写入操作日志 outbox 失败: %v", outboxErr)
+		}
 	}
 }
 
@@ -29,7 +32,10 @@ func LogOperationError(ctx context.Context, r *http.Request, username, operation
 		WithError(errMsg)
 
 	if err := mq.PublishOperationLog(ctx, msg); err != nil {
-		log.Printf("发送操作日志失败: %v", err)
+		log.Printf("发送操作日志失败，转入 outbox: %v", err)
+		if outboxErr := db.EnqueueOutbox(ctx, "operation_log", msg.ResourceID, msg); outboxErr != nil {
+			log.Printf("写入操作日志 outbox 失败: %v", outboxErr)
+		}
 	}
 }
 

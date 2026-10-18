@@ -24,9 +24,9 @@ type FileDeleteMessage struct {
 // ==================== 队列配置 ====================
 
 const (
-	FileDeleteDLX       = "file_delete_dlx"        // 死信交换机
-	FileDeleteWorkQueue = "file_delete_work_queue" // 工作队列
-	FileDeleteRoutingKey = "file_delete_work"      // 路由键
+	FileDeleteDLX        = "file_delete_dlx"        // 死信交换机
+	FileDeleteWorkQueue  = "file_delete_work_queue" // 工作队列
+	FileDeleteRoutingKey = "file_delete_work"       // 路由键
 )
 
 // ==================== 初始化队列 ====================
@@ -102,18 +102,7 @@ func PublishFileDeleteMessage(ctx context.Context, msg *FileDeleteMessage) error
 	}
 
 	// 发布消息到延迟队列
-	err = channel.PublishWithContext(
-		ctx,
-		"",                         // 默认交换机
-		config.RabbitMQDelayQueue,  // 路由到延迟队列
-		false,
-		false,
-		amqp.Publishing{
-			DeliveryMode: amqp.Persistent,    // 持久化消息
-			ContentType:  "application/json", // 消息内容类型
-			Body:         body,               // 消息体
-		},
-	)
+	err = publishWithConfirm(ctx, "", config.RabbitMQDelayQueue, body, nil)
 	if err != nil {
 		return fmt.Errorf("发布消息失败: %w", err)
 	}
@@ -126,45 +115,14 @@ func PublishFileDeleteMessage(ctx context.Context, msg *FileDeleteMessage) error
 
 // ConsumeFileDeleteMessages 消费文件删除消息（从工作队列）
 func ConsumeFileDeleteMessages(handler func(*FileDeleteMessage) error) error {
-	// 开始消费工作队列
-	msgs, err := channel.Consume(
-		FileDeleteWorkQueue,
-		"",
-		false, // 手动确认
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("消费队列失败: %w", err)
-	}
-
-	log.Println("开始消费文件删除消息...")
-
-	// 启动一个 goroutine 来监听
-	go func() {
-		for msg := range msgs {
-			// 解析消息
-			var fileMsg FileDeleteMessage
-			if err := json.Unmarshal(msg.Body, &fileMsg); err != nil {
-				log.Printf("解析消息失败: %v", err)
-				msg.Nack(false, false) // 拒绝消息，不重新入队
-				continue
-			}
-
-			log.Printf("处理文件删除: username=%s, filehash=%s", fileMsg.Username, fileMsg.FileHash)
-
-			if err := handler(&fileMsg); err != nil {
-				log.Printf("处理文件删除失败: %v", err)
-				msg.Nack(false, true) // 拒绝消息，重新入队
-			} else {
-				msg.Ack(false) // 确认消息（成功处理）
-			}
+	return ConsumeJSON(FileDeleteWorkQueue, func(body []byte) error {
+		var msg FileDeleteMessage
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return err
 		}
-	}()
-
-	return nil
+		log.Printf("处理文件删除: username=%s, filehash=%s", msg.Username, msg.FileHash)
+		return handler(&msg)
+	})
 }
 
 // ==================== 辅助函数 ====================
@@ -178,4 +136,3 @@ func NewFileDeleteMessage(username, fileHash, fileName string) *FileDeleteMessag
 		DeletedAt: time.Now(),
 	}
 }
-

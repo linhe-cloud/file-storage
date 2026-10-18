@@ -1,18 +1,21 @@
 package handler
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"file-storage-linhe/internal/cache/redis"
 	"file-storage-linhe/internal/db"
 	"file-storage-linhe/internal/handler/auth"
 	"file-storage-linhe/internal/mq"
+	"file-storage-linhe/internal/service"
 	"net/http"
 	"strconv"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+var userService = service.NewUserService()
 
 type User struct {
 	ID         int64     `json:"id,omitempty"`
@@ -57,35 +60,14 @@ func SignupHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 校验用户名长度（3-20个字符）
-	if len(username) < 3 || len(username) > 20 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "username must be between 3 and 20 characters"})
-		return
-	}
-
-	// 校验密码长度（至少6个字符）
-	if len(password) < 6 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password must be at least 6 characters"})
-		return
-	}
-
-	// 检查用户名是否已存在
-	existingUser, _ := db.GetUserByNameWithPwd(r.Context(), username)
-	if existingUser != nil {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "username already exists"})
-		return
-	}
-
-	// 通过 bcrypt 加密
-	hashed, err := encryptPassword(password)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encrypt password"})
-		return
-	}
-
-	// 写入数据库
-	if err := db.UserSingup(r.Context(), username, hashed); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to signup"})
+	if err := userService.Signup(r.Context(), username, password); err != nil {
+		if errors.Is(err, service.ErrInvalidUserInput) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid username or password"})
+		} else if errors.Is(err, service.ErrUserExists) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "username already exists"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to signup"})
+		}
 		return
 	}
 
@@ -117,14 +99,8 @@ func SigninHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u, err := db.GetUserByNameWithPwd(r.Context(), username)
-	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
-		return
-	}
-
-	// 校验密码
-	if !verifyPassword(u.UserPwd, password) {
+	token, err := userService.Signin(r.Context(), username, password)
+	if errors.Is(err, service.ErrInvalidCredentials) {
 		// 记录登录失败日志
 		LogOperationError(
 			r.Context(),
@@ -138,18 +114,8 @@ func SigninHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
 		return
 	}
-
-	// 生成 JWT（24小时过期）
-	tokenTTL := 24 * time.Hour
-	token, err := auth.GenerateToken(username, tokenTTL)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "generate token failed"})
-		return
-	}
-
-	// 存储到redis（实现单点登录，新token会覆盖旧token）
-	if err := redis.SetUserToken(r.Context(), username, token, tokenTTL); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to set user token"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "signin failed"})
 		return
 	}
 
@@ -180,17 +146,7 @@ func UserInfoHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 从缓存获取用户信息（缓存未命中时自动查DB并回写）
-	user, err := redis.GetUserInfoCache(r.Context(), username, func(ctx context.Context, username string) (*redis.User, error) {
-		// 适配器：将 db.User 转换为 redis.User
-		dbUser, err := db.GetUserInfo(ctx, username)
-		if err != nil {
-			return nil, err
-		}
-		return &redis.User{
-			UserName: dbUser.UserName,
-			SignupAt: dbUser.SignupAt,
-		}, nil
-	})
+	user, err := userService.Info(r.Context(), username)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "get user info failed"})
 		return
@@ -215,7 +171,7 @@ func SignoutHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := redis.DeleteUserToken(r.Context(), username); err != nil {
+	if err := userService.Signout(r.Context(), username); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "signout failed"})
 		return
 	}
@@ -256,38 +212,38 @@ func OnlineDevicesHandler(w http.ResponseWriter, r *http.Request) {
 
 // UserLogsHandler 查询操作日志：GET /user/logs
 func UserLogsHandler(w http.ResponseWriter, r *http.Request) {
-    if r.Method != http.MethodGet {
-        w.WriteHeader(http.StatusMethodNotAllowed)
-        return
-    }
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 
-    username, ok := auth.UsernameFromContext(r.Context())
-    if !ok || username == "" {
-        writeJSON(w, http.StatusUnauthorized, map[string]string{
-            "error": "unauthorized",
-        })
-        return
-    }
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error": "unauthorized",
+		})
+		return
+	}
 
-    // 获取查询参数
-    limitStr := r.URL.Query().Get("limit")
-    limit := 100 // 默认100条
-    if limitStr != "" {
-        if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 500 {
-            limit = l
-        }
-    }
+	// 获取查询参数
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100 // 默认100条
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 500 {
+			limit = l
+		}
+	}
 
-    logs, err := db.GetUserOperationLogs(r.Context(), username, limit)
-    if err != nil {
-        writeJSON(w, http.StatusInternalServerError, map[string]string{
-            "error": "failed to get operation logs",
-        })
-        return
-    }
+	logs, err := db.GetUserOperationLogs(r.Context(), username, limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "failed to get operation logs",
+		})
+		return
+	}
 
-    writeJSON(w, http.StatusOK, map[string]interface{}{
-        "logs":  logs,
-        "count": len(logs),
-    })
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"logs":  logs,
+		"count": len(logs),
+	})
 }

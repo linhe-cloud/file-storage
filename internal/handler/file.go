@@ -5,30 +5,51 @@ package handler
  */
 
 import (
+	"errors"
 	"file-storage-linhe/config"
 	cacheRedis "file-storage-linhe/internal/cache/redis"
 	"file-storage-linhe/internal/db"
 	"file-storage-linhe/internal/handler/auth"
-	"file-storage-linhe/internal/meta"
 	"file-storage-linhe/internal/mq"
+	"file-storage-linhe/internal/service"
 	"file-storage-linhe/internal/store"
-	"file-storage-linhe/util"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strconv"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 )
+
+var fileService = service.NewFileService()
+var multipartService = service.NewMultipartService()
+
+// userOwnsActiveFile 检查用户是否拥有指定的活跃文件
+// 参数:
+//
+//	r - HTTP请求指针，用于获取上下文信息
+//	username - 用户名
+//	fileHash - 文件的哈希值
+//
+// 返回值:
+//
+//	bool - 如果用户拥有活跃文件则返回true，否则返回false
+//	error - 如果发生错误则返回相应的错误信息
+func userOwnsActiveFile(r *http.Request, username, fileHash string) (bool, error) {
+	// 检查用户名和文件哈希是否为空
+	if username == "" || fileHash == "" {
+		return false, nil
+	}
+	// 调用数据库函数检查用户文件是否可用
+	return db.IsUserFileAvailable(r.Context(), username, fileHash)
+}
 
 // ======================= 上传 & 下载 =======================
 
 // 上传文件：POST /file/upload
+// UploadHandler 处理文件上传请求的HTTP处理器函数
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
+	// 只允许POST方法
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -52,73 +73,15 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	fileMeta := &meta.FileMeta{
-		FileName:   header.Filename,
-		Location:   "/tmp/" + header.Filename,
-		UploadTime: time.Now(),
-	}
-	newFile, err := os.Create(fileMeta.Location)
+	fileMeta, err := fileService.Upload(r.Context(), username, header.Filename, file)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		if errors.Is(err, service.ErrFileBeingUploaded) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed"})
+		}
 		return
 	}
-	defer newFile.Close()
-
-	fileMeta.FileSize, err = io.Copy(newFile, file)
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	newFile.Seek(0, 0)
-	fileMeta.FileSha1 = util.FileSha1(newFile)
-
-	//基于文件哈希的分布式锁（避免重复上传同一底层对象）
-	lockKey := "lock:" + fileMeta.FileSha1
-	lock := cacheRedis.NewLock(r.Context(), lockKey, time.Second*10)
-	locked, err := lock.TryLock()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to acquire lock"})
-		return
-	}
-	if !locked {
-		// 当前同一文件正在上传，提示客户端稍后重试
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "file is being uploaded"})
-		return
-	}
-	defer lock.Unlock()
-
-	// 游标重新回到文件头部，准备上传到 MinIO
-	newFile.Seek(0, 0)
-
-	// 上传到 MinIO
-	objectKey := "files/" + fileMeta.FileSha1
-	info, err := store.MinioClient.PutObject(
-		r.Context(),
-		config.MinioBucket,
-		objectKey,
-		newFile,
-		fileMeta.FileSize,
-		minio.PutObjectOptions{
-			ContentType: "application/octet-stream",
-		},
-	)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload to minio failed"})
-		return
-	}
-
-	// 更新 Location 为 MinIO 的对象路径
-	fileMeta.Location = objectKey
-
-	// 写入数据库
-	if err := db.InsertFileMeta(r.Context(), fileMeta); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "save file meta failed"})
-		return
-	}
-
-	// 写入缓存
-	_ = cacheRedis.SetFileMetaCache(r.Context(), fileMeta)
 
 	// 记录上传成功日志
 	LogOperation(
@@ -134,18 +97,19 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	)
 
-
 	// 返回成功响应
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"file_sha1": fileMeta.FileSha1,
 		"file_name": fileMeta.FileName,
-		"file_size": info.Size,
-		"location":  objectKey,
+		"file_size": fileMeta.FileSize,
+		"location":  fileMeta.Location,
 	})
 }
 
 // 下载文件：GET /file/download
+// DownloadHandler 处理文件下载请求的HTTP处理函数
 func DownloadHandler(w http.ResponseWriter, r *http.Request) {
+	// 只允许GET方法请求
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -162,6 +126,15 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 	fileHash := r.URL.Query().Get("filehash")
 	if fileHash == "" {
 		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	owned, err := userOwnsActiveFile(r, username, fileHash)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to verify file ownership"})
+		return
+	}
+	if !owned {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
 	}
 
@@ -200,7 +173,7 @@ func DownloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 设置响应头
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", "attachment; filename="+fm.FileName+"\"")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+fm.FileName+"\"")
 
 	// 把 MinIO 数据流拷贝到 HTTP 响应
 	if _, err := io.Copy(w, obg); err != nil {
@@ -222,6 +195,20 @@ func FileMetaHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	owned, err := userOwnsActiveFile(r, username, fileHash)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to verify file ownership"})
+		return
+	}
+	if !owned {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
 
 	// 从缓存获取文件元信息（缓存未命中时自动查DB并回写）
 	fm, err := cacheRedis.GetFileMetaCache(r.Context(), fileHash, db.GetFileMeta)
@@ -241,9 +228,22 @@ func FileMetaHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // 快速上传：POST /file/fastupload
+/**
+ * FastUploadHandler 处理文件快速上传的HTTP处理器
+ * @param w HTTP响应写入器
+ * @param r HTTP请求指针
+ */
 func FastUploadHandler(w http.ResponseWriter, r *http.Request) {
+	// 检查请求方法是否为POST，如果不是则返回405状态码
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 获取当前用户名
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
@@ -257,9 +257,9 @@ func FastUploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fm, err := db.GetFileMeta(r.Context(), fileHash)
-	if err != nil || fm == nil || fm.FileSha1 == "" {
-		w.WriteHeader(http.StatusInternalServerError)
+	fm, err := fileService.FastUpload(r.Context(), username, fileHash)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
 	}
 
@@ -295,46 +295,20 @@ func DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-
-	// 源文件信息，拿到 MinIO 的 key
-	fm, err := db.GetFileMeta(ctx, fileHash)
-	if err != nil || fm == nil || fm.FileSha1 == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "file not found"})
-		return
-	}
-
-	// 删除当前用户这条用户文件记录（username + filehash）
-	// 软删
-	if err := db.DeleteUserFile(ctx, username, fileHash); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete user file record"})
-		return
-	}
-
-	// 检查该 filehash 还有其他用户
-	stileUsed, err := db.ExistsUserFileByHash(ctx, fileHash)
+	lastReference, fm, err := fileService.Delete(r.Context(), username, fileHash)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check file usage"})
+		if errors.Is(err, service.ErrFileNotOwned) || errors.Is(err, service.ErrFileNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete file"})
+		}
 		return
 	}
-	if stileUsed {
-		// 还有其他用户在用，不删除MinIO 和 tbl_file
-		writeJSON(w, http.StatusOK, map[string]string{
-			"result": "delete success (file still used by others)",
-		})
+	if lastReference {
+		// 最后一个引用已进入延迟删除队列。
+		LogOperation(r.Context(), r, username, mq.OpDelete, mq.ResourceTypeFile, fileHash, map[string]string{"file_name": fm.FileName})
+		writeJSON(w, http.StatusOK, map[string]string{"result": "delete success"})
 		return
-	}
-
-	// 发送 MQ 延迟删除消息（3天后自动删除）
-	msg := &mq.FileDeleteMessage{
-		Username:  username,
-		FileHash:  fileHash,
-		FileName:  fm.FileName,
-		DeletedAt: time.Now(),
-	}
-	if err := mq.PublishFileDeleteMessage(ctx, msg); err != nil {
-		log.Printf("Failed to publish delete message: %v", err)
-		// 注意：即使 MQ 发送失败，用户侧已软删成功，不影响用户体验
 	}
 
 	LogOperation(
@@ -344,9 +318,7 @@ func DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		mq.OpDelete,
 		mq.ResourceTypeFile,
 		fileHash,
-		map[string]string{
-			"file_name": fm.FileName,
-		},
+		map[string]string{"file_name": fm.FileName},
 	)
 
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -354,10 +326,9 @@ func DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-
 // 回收站：GET /file/recycle
 func RecycleHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -399,8 +370,7 @@ func RestoreFileHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	if err := db.RestoreUserFile(r.Context(), username, fileHash); err != nil {
+	if err := fileService.Restore(r.Context(), username, fileHash); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to restore file"})
 		return
 	}
@@ -420,7 +390,8 @@ func RestoreFileHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func PremanentDeleteHandler(w http.ResponseWriter, r *http.Request) {
+// 永久删除文件：POST /file/permanentdelete
+func PermanentDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -431,40 +402,15 @@ func PremanentDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
-	
+
 	fileHash := r.URL.Query().Get("filehash")
 	if fileHash == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	ctx := r.Context()
-
-	fm, err := db.GetFileMeta(ctx, fileHash)
-	if err != nil || fm == nil || fm.FileSha1 == "" {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "file not found"})
+	if err := fileService.PermanentDelete(r.Context(), username, fileHash); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to permanently delete file"})
 		return
-	}
-
-	if err := db.PermanentDeleteUserFile(ctx, username, fileHash); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete file"})
-		return
-	}
-
-	stillUsed, err := db.ExistsUserFileByHash(ctx, fileHash)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check file usage"})
-		return
-	}
-
-	if !stillUsed {
-		if err := db.PermanentDeleteFileMeta(ctx, fileHash); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete file meta"})
-			return
-		}
-
-		_ = cacheRedis.DeleteFileMetaCache(ctx, fileHash)
-		_ = db.PermanentDeleteFileMeta(ctx, fileHash)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -473,9 +419,6 @@ func PremanentDeleteHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ======================= 分片上传 =======================
-
-// 默认分片大小：5MB
-const defaultChunkSize int64 = 5 * 1024 * 1024
 
 // 初始化分片上传：POST /file/multipart/init
 func MultipartInitHandler(w http.ResponseWriter, r *http.Request) {
@@ -504,49 +447,27 @@ func MultipartInitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 计算总分片数
-	chunkCount := int((fileSize + defaultChunkSize - 1) / defaultChunkSize)
-
-	// 生成唯一上传ID
-	uploadID := uuid.NewString()
-
-	ctx := r.Context()
-	infoKey := "multipart:info:" + uploadID
-	chunksKey := "multipart:chunks:" + uploadID
-
 	// 获取当前用户名
-	username, _ := auth.UsernameFromContext(r.Context())
-
-	// 在 Redis 中写入上传任务元信息
-	_, err = cacheRedis.Rdb.HSet(ctx, infoKey, map[string]interface{}{
-		"file_sha1":   fileHash,
-		"file_name":   fileName,
-		"file_size":   fileSize,
-		"chunk_count": chunkCount,
-		"chunk_size":  defaultChunkSize,
-		"upload_id":   uploadID,
-		"status":      "init",
-		"username":    username,
-		"created_at":  time.Now().Format(time.RFC3339),
-	}).Result()
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	info, err := multipartService.Init(r.Context(), username, fileHash, fileName, fileSize)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save upload info"})
 		return
 	}
-
-	// 设置过期时间
-	ttl := time.Hour * 24
-	cacheRedis.Rdb.Expire(ctx, infoKey, ttl)
-	cacheRedis.Rdb.Expire(ctx, chunksKey, ttl)
+	chunkSize := service.CalculateChunkSize(fileSize)
 
 	// 返回前端：uploadID + 分片信息
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"upload_id":   uploadID,
+		"upload_id":   info.UploadID,
 		"file_sha1":   fileHash,
 		"file_name":   fileName,
 		"file_size":   fileSize,
-		"chunk_size":  defaultChunkSize,
-		"chunk_count": chunkCount,
+		"chunk_size":  chunkSize,
+		"chunk_count": info.ChunkCount,
 	})
 }
 
@@ -554,6 +475,11 @@ func MultipartInitHandler(w http.ResponseWriter, r *http.Request) {
 func MultipartUploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
@@ -577,72 +503,27 @@ func MultipartUploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取分片文件流
-	chunkFile, _, err := r.FormFile("file")
+	chunkFile, chunkHeader, err := r.FormFile("file")
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	defer chunkFile.Close()
 
-	ctx := r.Context()
-	infoKey := "multipart:info:" + uploadID
-	chunksKey := "multipart:chunks:" + uploadID
-
-	// 1. 从 redis 读取上传任务元信息，校验任务存在
-	info, err := cacheRedis.Rdb.HGetAll(ctx, infoKey).Result()
+	err = multipartService.UploadChunk(r.Context(), username, uploadID, chunkIndex, chunkFile, chunkHeader.Size)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to get upload info"})
-		return
-	}
-
-	// 2. 校验 chunk_index 合法（范围： 0 ～ chunk_count - 1）
-	chunkCount, _ := strconv.Atoi(info["chunk_count"])
-	if chunkIndex >= chunkCount {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "chunk index out of range"})
-		return
-	}
-
-	// 3. 幂等处理：检查该分片是否已经上传成功
-	exists, err := cacheRedis.Rdb.SIsMember(ctx, chunksKey, chunkIndex).Result()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to check chunk existence"})
-		return
-	}
-	if exists {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "chunk already uploaded"})
-		return
-	}
-
-	// 4. 上传分片到 Minio
-	// 分片对象 key 格式：multipart/<uploadID>/<chunkIndex>
-	objectKey := fmt.Sprintf("multipart/%s/%d", uploadID, chunkIndex)
-
-	_, err = store.MinioClient.PutObject(
-		ctx,
-		config.MinioBucket,
-		objectKey,
-		chunkFile,
-		-1, // -1标识自动读取流大小
-		minio.PutObjectOptions{
-			ContentType: "application/octet-stream",
-		},
-	)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to upload chunk"})
-		return
-	}
-
-	// 5. 更新 Redis 进度：
-	// - 把 chunk_index 加入 set（表示已上传）
-	// - 把 uploaded_chunks 计数 +1
-	// - 如果是首次上传分片，把 status 改为 "uploading"
-	pipe := cacheRedis.Rdb.TxPipeline()
-	pipe.SAdd(ctx, chunksKey, chunkIndex)
-	pipe.HIncrBy(ctx, infoKey, "uploaded_chunks", 1)
-	pipe.HSet(ctx, infoKey, "status", "uploading")
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update upload progress"})
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, service.ErrMultipartNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, service.ErrMultipartForbidden):
+			status = http.StatusForbidden
+		case errors.Is(err, service.ErrChunkAlreadyUploaded), errors.Is(err, service.ErrChunkOutOfRange), errors.Is(err, service.ErrChunkSizeInvalid), errors.Is(err, service.ErrMultipartNotAccepting):
+			status = http.StatusBadRequest
+		case errors.Is(err, service.ErrChunkBusy):
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -666,27 +547,26 @@ func MultipartStatusHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	ctx := r.Context()
-	infoKey := "multipart:info:" + uploadID
-	chunksKey := "multipart:chunks:" + uploadID
-
-	info, err := cacheRedis.Rdb.HGetAll(ctx, infoKey).Result()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to get upload info"})
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
-	// 获取分片数和当前状态
-	chunkCount, _ := strconv.Atoi(info["chunk_count"])
-	status := info["status"]
-
-	// 从Redis Set 获取实际已上传到分片数
-	uploadedChunks, err := cacheRedis.Rdb.SCard(ctx, chunksKey).Result()
+	info, uploadedChunks, completed, err := multipartService.Status(r.Context(), username, uploadID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to get uploaded chunks"})
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, service.ErrMultipartNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, service.ErrMultipartForbidden):
+			status = http.StatusForbidden
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
+	chunkCount := info.ChunkCount
+	status := info.Status
 
 	// 计算百分比
 	var progress int
@@ -695,8 +575,6 @@ func MultipartStatusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 判断是否全部上传完成
-	completed := int(uploadedChunks) == chunkCount && chunkCount > 0
-
 	// 返回结果
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"upload_id":       uploadID,
@@ -708,135 +586,138 @@ func MultipartStatusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+/**
+ * MultipartCompleteHandler 处理文件分片上传完成的请求
+ * 该函数用于验证上传参数、检查分片完整性，并触发文件合并任务
+ * @param w http.ResponseWriter - HTTP响应写入器
+ * @param r *http.Request - HTTP请求指针
+ */
 func MultipartCompleteHandler(w http.ResponseWriter, r *http.Request) {
+	// 只允许POST请求
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 解析参数：upload_id
+	// 获取当前用户名
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	// 解析参数：upload_id, file_name, chunk_count, file_size
 	if err := r.ParseForm(); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	uploadID := r.FormValue("upload_id")
-	if uploadID == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+	fileName := r.FormValue("file_name")
+	chunkCountStr := r.FormValue("chunk_count")
+	fileSizeStr := r.FormValue("file_size")
 
-	ctx := r.Context()
-	infoKey := "multipart:info:" + uploadID
-	chunksKey := "multipart:chunks:" + uploadID
-
-	// 从 Redis 获取上传任务元信息
-	info, err := cacheRedis.Rdb.HGetAll(ctx, infoKey).Result()
-	if err != nil || len(info) == 0 {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload task not found"})
-		return
-	}
-
-	// 提取相关信息
-	fileSha1 := info["file_sha1"]
-	fileName := info["file_name"]
-	fileSize, _ := strconv.ParseInt(info["file_size"], 10, 64)
-	chunkCount, _ := strconv.Atoi(info["chunk_count"])
-	username := info["username"]
-
-	// 校验所有分片是否已上传完成
-	uploadedChunks, err := cacheRedis.Rdb.SCard(ctx, chunksKey).Result()
-	if err != nil || int(uploadedChunks) != chunkCount {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{
-			"error": fmt.Sprintf("not all chunks uploaded, uploaded: %d, total: %d", uploadedChunks, chunkCount),
+	if uploadID == "" || fileName == "" || chunkCountStr == "" || fileSizeStr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "missing required parameters",
 		})
 		return
 	}
 
-	// 分布式锁：防止重复合并（基于 fileSha1）
-	lockKey := "lock:merge:" + uploadID
-	lock := cacheRedis.NewLock(ctx, lockKey, 10*time.Minute)
-	if locked, err := lock.TryLock(); err != nil || !locked {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to acquire lock"})
+	if _, err := strconv.Atoi(chunkCountStr); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid chunk_count"})
 		return
 	}
-	defer lock.Unlock()
-
-	// 检查 status，防止重复
-	currentStatus := info["status"]
-	if currentStatus == "completed" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "upload already completed"})
+	if _, err := strconv.ParseInt(fileSizeStr, 10, 64); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid file_size"})
+		return
 	}
-
-	// Minio ComposeObject 合并分片
-	var srcs []minio.CopySrcOptions
-	for i := 0; i < chunkCount; i++ {
-		chunkKey := fmt.Sprintf("multipart/%s/%d", uploadID, i)
-		src := minio.CopySrcOptions{
-			Bucket: config.MinioBucket,
-			Object: chunkKey,
-		}
-		srcs = append(srcs, src)
-	}
-
-	finalObjectKey := "files/" + fileSha1
-
-	// ComposeObject 合并分片
-	_, err = store.MinioClient.ComposeObject(ctx, minio.CopyDestOptions{
-		Bucket: config.MinioBucket,
-		Object: finalObjectKey,
-	}, srcs...)
+	info, err := multipartService.SubmitMerge(r.Context(), username, uploadID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to merge chunks"})
+		switch {
+		case errors.Is(err, service.ErrMultipartNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		case errors.Is(err, service.ErrMultipartForbidden):
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		case errors.Is(err, service.ErrMultipartIncomplete), errors.Is(err, service.ErrMultipartAlreadyHandled):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error(), "upload_id": uploadID})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to submit merge task"})
+		}
 		return
 	}
 
-	// 写入 MySQL 文件元信息
-	fm := &meta.FileMeta{
-		FileName:   fileName,
-		FileSha1:   fileSha1,
-		FileSize:   fileSize,
-		Location:   finalObjectKey,
-		UploadTime: time.Now(),
-	}
-	if err := db.InsertFileMeta(ctx, fm); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to insert file meta"})
-		return
-	}
+	log.Printf("分片合并任务已提交: upload_id=%s, user=%s, file=%s", uploadID, username, info.FileName)
 
-	// 写入缓存
-	_ = cacheRedis.SetFileMetaCache(ctx, fm)
-
-	// 写入用户-文件关系表
-	if username != "" {
-		if err := db.InsertUserFile(ctx, username, fileSha1, fileName, fileSize); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to insert user file relation"})
-			return
-		}
-	}
-
-	// 更新 redis 任务状态为 completed
-	cacheRedis.Rdb.HSet(ctx, infoKey, "status", "completed")
-	cacheRedis.Rdb.HSet(ctx, infoKey, "location", finalObjectKey)
-
-	// 异步删除临时分片对象
-	go func() {
-		for i := 0; i < chunkCount; i++ {
-			chunkKey := fmt.Sprintf("multipart/%s/%d", uploadID, i)
-			store.MinioClient.RemoveObject(ctx, config.MinioBucket, chunkKey, minio.RemoveObjectOptions{})
-		}
-	}()
-
-	// 设置 redis key 短期 ttl（1小时）
-	cacheRedis.Rdb.Expire(ctx, infoKey, time.Hour)
-	cacheRedis.Rdb.Expire(ctx, chunksKey, time.Hour)
-
-	writeJSON(w, http.StatusOK, map[string]string{
-		"result":      "multipart upload completed",
-		"file_sha1":   fileSha1,
-		"file_name":   fileName,
-		"file_size":   strconv.FormatInt(fileSize, 10),
-		"location":    finalObjectKey,
-		"upload_time": fm.UploadTime.Format(time.RFC3339),
+	// 立即返回，告诉用户任务已提交
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":   "merge task submitted successfully",
+		"upload_id": uploadID,
+		"status":    "processing",
+		"tip":       "请使用 /file/multipart/merge-status 接口查询合并进度",
 	})
+}
+
+// MultipartMergeStatusHandler 查询分片合并状态
+// GET /file/multipart/merge-status?upload_id=xxx
+func MultipartMergeStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	username, ok := auth.UsernameFromContext(r.Context())
+	if !ok || username == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	uploadID := r.URL.Query().Get("upload_id")
+	if uploadID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "upload_id is required",
+		})
+		return
+	}
+
+	ctx := r.Context()
+
+	// 从 Redis 获取任务信息
+	chunkInfo, err := cacheRedis.GetChunkInfo(ctx, uploadID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": "upload task not found",
+		})
+		return
+	}
+
+	// 验证是否是当前用户的任务
+	if chunkInfo.Username != username {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error": "access denied",
+		})
+		return
+	}
+
+	// 构造响应
+	response := map[string]interface{}{
+		"upload_id": uploadID,
+		"status":    chunkInfo.Status, // uploading / processing / completed / failed
+		"file_name": chunkInfo.FileName,
+		"file_size": chunkInfo.FileSize,
+	}
+
+	// 如果已完成，返回文件哈希
+	if chunkInfo.Status == "completed" && chunkInfo.FileSha1 != "" {
+		response["file_sha1"] = chunkInfo.FileSha1
+		response["message"] = "文件合并完成"
+	} else if chunkInfo.Status == "processing" {
+		response["message"] = "文件正在合并中，请稍后查询"
+	} else if chunkInfo.Status == "uploading" {
+		response["message"] = "分片上传中"
+	} else if chunkInfo.Status == "failed" {
+		response["message"] = "文件合并失败"
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }

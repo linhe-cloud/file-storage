@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log"
 	"time"
-
-	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // ==================== 消息结构 ====================
@@ -15,14 +13,14 @@ import (
 // OperationLogMessage 操作日志消息
 type OperationLogMessage struct {
 	UserName     string            `json:"user_name"`
-	Operation    string            `json:"operation"`      // login/upload/download/delete/restore等
-	ResourceType string            `json:"resource_type"`  // file/user等
-	ResourceID   string            `json:"resource_id"`    // 文件hash/用户名等
+	Operation    string            `json:"operation"`     // login/upload/download/delete/restore等
+	ResourceType string            `json:"resource_type"` // file/user等
+	ResourceID   string            `json:"resource_id"`   // 文件hash/用户名等
 	IPAddress    string            `json:"ip_address"`
 	UserAgent    string            `json:"user_agent"`
-	Status       string            `json:"status"`         // success/failed
+	Status       string            `json:"status"` // success/failed
 	ErrorMsg     string            `json:"error_msg,omitempty"`
-	ExtraInfo    map[string]string `json:"extra_info,omitempty"`	// 额外信息
+	ExtraInfo    map[string]string `json:"extra_info,omitempty"` // 额外信息
 	CreatedAt    time.Time         `json:"created_at"`
 }
 
@@ -82,18 +80,7 @@ func PublishOperationLog(ctx context.Context, msg *OperationLogMessage) error {
 		return fmt.Errorf("序列化操作日志失败: %w", err)
 	}
 
-	err = channel.PublishWithContext(
-		ctx,
-		"",                // 默认交换机
-		OperationLogQueue, // 路由到操作日志队列
-		false,
-		false,
-		amqp.Publishing{
-			DeliveryMode: amqp.Persistent,
-			ContentType:  "application/json",
-			Body:         body,
-		},
-	)
+	err = publishWithConfirm(ctx, "", OperationLogQueue, body, nil)
 	if err != nil {
 		return fmt.Errorf("发布操作日志失败: %w", err)
 	}
@@ -105,43 +92,14 @@ func PublishOperationLog(ctx context.Context, msg *OperationLogMessage) error {
 
 // ConsumeOperationLogs 消费操作日志消息
 func ConsumeOperationLogs(handler func(*OperationLogMessage) error) error {
-	msgs, err := channel.Consume(
-		OperationLogQueue,
-		"",
-		false, // 手动确认
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("消费操作日志队列失败: %w", err)
-	}
-
-	log.Println("开始消费操作日志消息...")
-
-	go func() {
-		for msg := range msgs {
-			var logMsg OperationLogMessage
-			if err := json.Unmarshal(msg.Body, &logMsg); err != nil {
-				log.Printf("解析操作日志消息失败: %v", err)
-				msg.Nack(false, false) // 拒绝消息，不重新入队
-				continue
-			}
-
-			log.Printf("处理操作日志: user=%s, op=%s, resource=%s",
-				logMsg.UserName, logMsg.Operation, logMsg.ResourceID)
-
-			if err := handler(&logMsg); err != nil {
-				log.Printf("处理操作日志失败: %v", err)
-				msg.Nack(false, true) // 拒绝消息，重新入队
-			} else {
-				msg.Ack(false) // 确认消息
-			}
+	return ConsumeJSON(OperationLogQueue, func(body []byte) error {
+		var msg OperationLogMessage
+		if err := json.Unmarshal(body, &msg); err != nil {
+			return err
 		}
-	}()
-
-	return nil
+		log.Printf("处理操作日志: user=%s, op=%s, resource=%s", msg.UserName, msg.Operation, msg.ResourceID)
+		return handler(&msg)
+	})
 }
 
 // ==================== 辅助函数 ====================

@@ -13,6 +13,7 @@ type User struct {
 	UserName string
 	UserPwd  string
 	SignupAt time.Time
+	Status   int
 }
 
 // 用户注册
@@ -27,8 +28,8 @@ func UserSingup(ctx context.Context, username, userpwd string) error {
 func GetUserByNameWithPwd(ctx context.Context, username string) (*User, error) {
 	u := &User{}
 	err := DB.QueryRowContext(ctx,
-		"SELECT user_name, user_pwd FROM tbl_user WHERE user_name = ? LIMIT 1",
-		username).Scan(&u.UserName, &u.UserPwd)
+		"SELECT user_name, user_pwd, status FROM tbl_user WHERE user_name = ? LIMIT 1",
+		username).Scan(&u.UserName, &u.UserPwd, &u.Status)
 	if err != nil {
 		return nil, err
 	}

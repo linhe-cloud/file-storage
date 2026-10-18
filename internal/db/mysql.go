@@ -5,6 +5,7 @@ package db
  */
 
 import (
+	"context"
 	"database/sql"
 	"file-storage-linhe/config"
 	"log"
@@ -27,6 +28,10 @@ func InitDB() error {
 	DB.SetConnMaxLifetime(300 * time.Second) // 连接最大生命周期
 
 	if err := DB.Ping(); err != nil {
+		_ = DB.Close()
+		return err
+	}
+	if err := EnsureOutboxTable(context.Background()); err != nil {
 		_ = DB.Close()
 		return err
 	}

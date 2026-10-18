@@ -15,6 +15,9 @@ bin/
 *.test
 *.out
 
+# Runtime signing keys must be provisioned outside version control.
+config/key/*.pem
+
 # Logs
 *.log
 
